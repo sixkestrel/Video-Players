@@ -1,0 +1,10 @@
+{
+  "name": "lan-video-player",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A small local-network video streaming app for files stored on this PC.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
