@@ -3,6 +3,7 @@ const fsp = require("node:fs/promises");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
+const { spawn, spawnSync } = require("node:child_process");
 const { URL } = require("node:url");
 
 const HOST = process.env.HOST || "0.0.0.0";
@@ -17,6 +18,8 @@ const VIDEO_EXTENSIONS = new Set([
   ".mkv",
   ".avi"
 ]);
+const FFMPEG_PATH = process.env.FFMPEG_PATH || "ffmpeg";
+const ENABLE_MKV_TRANSCODE = process.env.ENABLE_MKV_TRANSCODE !== "false";
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -35,6 +38,31 @@ const MIME_TYPES = {
   ".mkv": "video/x-matroska",
   ".avi": "video/x-msvideo"
 };
+
+const transcoding = {
+  available: false,
+  checked: false,
+  command: FFMPEG_PATH,
+  enabled: ENABLE_MKV_TRANSCODE
+};
+
+function detectFfmpeg() {
+  if (!ENABLE_MKV_TRANSCODE) {
+    transcoding.available = false;
+    transcoding.checked = true;
+    return transcoding;
+  }
+
+  const result = spawnSync(FFMPEG_PATH, ["-version"], {
+    stdio: "ignore",
+    timeout: 4000,
+    windowsHide: true
+  });
+
+  transcoding.available = result.status === 0 && !result.error;
+  transcoding.checked = true;
+  return transcoding;
+}
 
 function sendJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
@@ -93,6 +121,7 @@ async function walkVideos(directory, root = directory) {
 
     const stats = await fsp.stat(fullPath);
     const relativePath = path.relative(root, fullPath).split(path.sep).join("/");
+    const requiresTranscode = extension === ".mkv" && transcoding.enabled && transcoding.available;
 
     items.push({
       id: relativePath,
@@ -101,7 +130,8 @@ async function walkVideos(directory, root = directory) {
       relativePath,
       extension,
       size: stats.size,
-      updatedAt: stats.mtime.toISOString()
+      updatedAt: stats.mtime.toISOString(),
+      playback: requiresTranscode ? "transcode" : "direct"
     });
   }
 
@@ -113,7 +143,12 @@ async function handleLibrary(response) {
     const videos = await walkVideos(VIDEO_ROOT);
     sendJson(response, 200, {
       root: VIDEO_ROOT,
-      videos
+      videos,
+      transcoding: {
+        enabled: transcoding.enabled,
+        available: transcoding.available,
+        mkv: transcoding.enabled && transcoding.available
+      }
     });
   } catch (error) {
     sendJson(response, 500, {
@@ -139,7 +174,7 @@ function parseRange(rangeHeader, size) {
   return { start, end };
 }
 
-function streamVideo(request, response, filePath) {
+function streamDirect(request, response, filePath) {
   fs.stat(filePath, (error, stats) => {
     if (error || !stats.isFile()) {
       sendText(response, 404, "Video not found.");
@@ -179,6 +214,99 @@ function streamVideo(request, response, filePath) {
   });
 }
 
+function streamTranscoded(response, filePath) {
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    filePath,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "192k",
+    "-movflags",
+    "frag_keyframe+empty_moov+faststart",
+    "-f",
+    "mp4",
+    "pipe:1"
+  ];
+
+  const ffmpeg = spawn(FFMPEG_PATH, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true
+  });
+
+  let stderr = "";
+  let headersSent = false;
+
+  ffmpeg.stderr.on("data", (chunk) => {
+    stderr += chunk.toString();
+  });
+
+  ffmpeg.on("error", (error) => {
+    if (!headersSent) {
+      sendText(response, 500, `Unable to start ffmpeg: ${error.message}`);
+    } else {
+      response.destroy(error);
+    }
+  });
+
+  ffmpeg.stdout.once("data", (chunk) => {
+    headersSent = true;
+    response.writeHead(200, {
+      "Content-Type": "video/mp4",
+      "Cache-Control": "no-store",
+      "X-Transcode-Mode": "ffmpeg"
+    });
+    response.write(chunk);
+  });
+
+  ffmpeg.stdout.on("data", (chunk) => {
+    if (!headersSent) {
+      return;
+    }
+    response.write(chunk);
+  });
+
+  ffmpeg.stdout.on("end", () => {
+    if (headersSent) {
+      response.end();
+    }
+  });
+
+  ffmpeg.on("close", (code) => {
+    if (!headersSent && code !== 0) {
+      sendText(response, 500, stderr || "ffmpeg transcoding failed.");
+      return;
+    }
+
+    if (code !== 0 && !response.destroyed) {
+      response.destroy(new Error(stderr || `ffmpeg exited with code ${code}`));
+    }
+  });
+
+  response.on("close", () => {
+    if (!ffmpeg.killed) {
+      ffmpeg.kill("SIGKILL");
+    }
+  });
+}
+
+function shouldTranscode(extension) {
+  return extension === ".mkv" && transcoding.enabled && transcoding.available;
+}
+
 async function handleStream(request, response, url) {
   const requestedFile = url.searchParams.get("file");
   if (!requestedFile) {
@@ -194,7 +322,13 @@ async function handleStream(request, response, url) {
     return;
   }
 
-  streamVideo(request, response, absolutePath);
+  const extension = path.extname(absolutePath).toLowerCase();
+  if (shouldTranscode(extension)) {
+    streamTranscoded(response, absolutePath);
+    return;
+  }
+
+  streamDirect(request, response, absolutePath);
 }
 
 async function serveStatic(response, pathname) {
@@ -220,6 +354,7 @@ async function serveStatic(response, pathname) {
 
 async function start() {
   await ensureVideoRoot();
+  detectFfmpeg();
 
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
@@ -249,6 +384,13 @@ async function start() {
       console.log(`Available on http://${address}:${PORT}`);
     }
     console.log(`Video library: ${VIDEO_ROOT}`);
+    if (transcoding.enabled && transcoding.available) {
+      console.log(`MKV transcoding enabled via ${FFMPEG_PATH}`);
+    } else if (transcoding.enabled) {
+      console.log("MKV transcoding disabled because ffmpeg was not detected.");
+    } else {
+      console.log("MKV transcoding disabled by configuration.");
+    }
   });
 }
 

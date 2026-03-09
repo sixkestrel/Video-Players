@@ -18,6 +18,11 @@ let activeVideoId = null;
 let selectedFolderPath = "";
 let expandedFolders = new Set([""]);
 let folderTree = createFolderNode("", "Library");
+let transcoding = {
+  enabled: false,
+  available: false,
+  mkv: false
+};
 
 function createFolderNode(path, name) {
   return {
@@ -51,7 +56,7 @@ function buildFolderTree(items) {
 
   for (const video of items) {
     const segments = video.relativePath.split("/");
-    const fileName = segments.pop();
+    segments.pop();
     let currentPath = "";
     let parent = root;
 
@@ -100,7 +105,7 @@ function getFolderByPath(path) {
 function getVisibleVideos() {
   const query = searchInput.value.trim().toLowerCase();
   const selectedFolder = getFolderByPath(selectedFolderPath);
-  let pool = selectedFolderPath ? selectedFolder.videos : videos;
+  const pool = selectedFolderPath ? selectedFolder.videos : videos;
 
   if (!query) {
     return pool;
@@ -132,6 +137,18 @@ function folderMatchesQuery(folder, query) {
 
   return folder.folders.some((child) => folderMatchesQuery(child, query)) ||
     folder.videos.some((video) => `${video.name} ${video.relativePath}`.toLowerCase().includes(query));
+}
+
+function getPlaybackNote(video) {
+  if (video.extension === ".mkv" && transcoding.mkv) {
+    return "MKV will be transcoded to MP4 for playback";
+  }
+
+  if (video.extension === ".mkv") {
+    return "MKV will be streamed directly; browser support may vary";
+  }
+
+  return "";
 }
 
 function selectFolder(path) {
@@ -226,17 +243,23 @@ function renderVideos(items) {
       button.classList.add("active");
     }
 
+    const playbackNote = getPlaybackNote(video);
+
     button.innerHTML = `
       <h3>${video.name}</h3>
       <p>${video.relativePath}</p>
       <p>${formatBytes(video.size)}</p>
+      ${playbackNote ? `<p>${playbackNote}</p>` : ""}
     `;
 
     button.addEventListener("click", () => {
       activeVideoId = video.id;
       player.src = `/api/stream?file=${encodeURIComponent(video.relativePath)}`;
       nowPlayingTitle.textContent = video.name;
-      nowPlayingMeta.textContent = `${video.relativePath} • ${formatBytes(video.size)}`;
+      nowPlayingMeta.textContent = [
+        `${video.relativePath} • ${formatBytes(video.size)}`,
+        playbackNote
+      ].filter(Boolean).join(" • ");
       player.play().catch(() => {});
       renderVideos(getVisibleVideos());
     });
@@ -256,9 +279,17 @@ async function loadLibrary() {
 
     const payload = await response.json();
     videos = payload.videos;
+    transcoding = payload.transcoding || transcoding;
     folderTree = buildFolderTree(videos);
     libraryRoot.textContent = payload.root;
-    updateStatus(`${videos.length} video${videos.length === 1 ? "" : "s"} available`);
+
+    let status = `${videos.length} video${videos.length === 1 ? "" : "s"} available`;
+    if (transcoding.mkv) {
+      status += " • MKV transcoding ready";
+    } else if (transcoding.enabled) {
+      status += " • ffmpeg not found for MKV transcoding";
+    }
+    updateStatus(status);
 
     if (selectedFolderPath && getFolderByPath(selectedFolderPath) === folderTree) {
       selectedFolderPath = "";

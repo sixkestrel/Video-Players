@@ -29,8 +29,28 @@ $env:PORT="5000"
 node server.js
 ```
 
+## Optional: enable ffmpeg transcoding for MKV
+
+If `ffmpeg` is installed and available on your `PATH`, the server will automatically transcode `.mkv` files to browser-friendly MP4 while streaming.
+
+If `ffmpeg` is installed somewhere else, point the app at it explicitly:
+
+```powershell
+$env:FFMPEG_PATH="C:\ffmpeg\bin\ffmpeg.exe"
+node server.js
+```
+
+To disable live MKV transcoding:
+
+```powershell
+$env:ENABLE_MKV_TRANSCODE="false"
+node server.js
+```
+
 ## Notes
 
 - The server binds to `0.0.0.0`, so other devices on your LAN can connect.
-- Seeking works because the app supports HTTP byte-range streaming.
-- Some browsers may not play every format equally well. `mp4` and `webm` are the safest options.
+- Direct file streaming still uses HTTP byte-range requests for seeking.
+- Live MKV transcoding does not provide full byte-range seeking because the MP4 is generated on the fly.
+- Some MKV files may still fail if ffmpeg is missing or the source file is damaged.
+- `mp4` and `webm` remain the safest formats for widest browser compatibility.
